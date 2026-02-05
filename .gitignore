@@ -7,5 +7,16 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
+venv/
+env/
+
+# UV
 uv.lock
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+.env
