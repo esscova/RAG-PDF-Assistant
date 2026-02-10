@@ -6,8 +6,7 @@ Combina: Persistência automática + Contextualização LCEL + Modo híbrido
 Recursos:
 - Persistência FAISS automática (índice salvo em disco)
 - Contextualização de perguntas com histórico (LCEL)
-- Modo híbrido: RAG on/off
-- Múltiplos PDFs com merge de índices
+- Múltiplos PDFs 
 """
 
 ################################################################################
@@ -19,7 +18,10 @@ import time
 import shutil
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Union
+from datetime import datetime
+import json
+import logging
 
 # LLM 
 from langchain_groq import ChatGroq
@@ -29,7 +31,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableBranch
+from langchain_core.runnables import RunnablePassthrough
 
 # pdf loader e vectordb
 from langchain_community.document_loaders import PyMuPDFLoader
@@ -44,6 +46,13 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 ################################################################################
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
+logger = logging.getLogger(__name__)
 
 GROQ_MODELS = {
     "llama-3.3-70b": "llama-3.3-70b-versatile",
@@ -63,377 +72,531 @@ DEFAULT_CONFIG = {
     "retriever_k": 4,
     "retriever_fetch_k": 8,
     "max_history_messages": 10,
-    "index_path": "faiss_index",  
+    "index_dir": "indices",
 }
+
+LLM_DEPENDENT = ['model', 'temperature', 'max_tokens']
+RETRIEVER_DEPENDENT = ['retriever_k', 'retriever_fetch_k']
+EMBEDDING_DEPENDENT = ['embeddings_model', 'chunk_size', 'chunk_overlap']
 
 ################################################################################
 # CLASSE PRINCIPAL
 ################################################################################
 
-class RAGChatBot:
+class ChatBot:
     """
-    ChatBot RAG com persistência, contextualização e modo híbrido.
-
-    Uso:
-        bot = RAGChatBot()
-        bot.load_documents(['doc1.pdf', 'doc2.pdf'])
-        bot.chat('Qual o tema principal?')
+    ChatBot com Lazy Loading e Configuração Dinâmica.
     """
 
-    def __init__(self, config:Dict[str,Any]=None, api_key:str=None):
-        """
-        Inicializa o chatbot
-
-        Args:
-            config: configurações personalizadas (opcional)
-            api_key: chave API Groq(opcional, lê do .env se não fornecida)
-        """
+    def __init__(self, config: Dict[str, Any] = None, api_key: str = None):
         self.config = config or DEFAULT_CONFIG.copy()
         self.api_key = api_key or os.getenv('GROQ_API_KEY')
 
         if not self.api_key:
-            raise ValueError('GROQ_API_KEY não configurada, use .env ou passe api_key=')
+            raise ValueError('GROQ_API_KEY não configurada!')
 
+        # componentes
         self.llm = None
-        self.history:List[Any] = []
-        self.documents_loaded = False
-        self.vectorstore = None
         self.embeddings = None
-        self.retriever = None
-        self.rag_chain = None
-        self.contextualized_retriever = None
+        self.history: List[Any] = []
 
+        # indices
+        self.indices: Dict[str, FAISS] = {}
+        self.retrievers: Dict[str, Any] = {}
 
-        print('=== INICIALIZANDO CHATBOT ===')
-        self._initialize_llm()
-        self._initialize_system_prompt()
-        self._initialize_embeddings()
-        print('ChatBot pronto!\n')
+        logger.info('\nInicializando ChatBot...')
+        self._init_llm()
+        self._init_embeddings()
+        self._init_system_prompt()
+        logger.info('ChatBot pronto!\n')
 
-    def _initialize_llm(self):
-        """Inicializa o modelo de linguagem Groq"""
+    def _init_llm(self):
+        """Inicializa LLM."""
         self.llm = ChatGroq(
             model=self.config['model'],
             temperature=self.config['temperature'],
             max_tokens=self.config['max_tokens'],
             api_key=self.api_key
         )
-        print(f'LLM: {self.config["model"]} carregado!')
+        logger.info(f'LLM: {self.config["model"]} (temp={self.config["temperature"]}, tokens={self.config["max_tokens"]})')
 
-    def _initialize_system_prompt(self):
-        """Mensagem fixa do sistema"""
-        system_message = SystemMessage(
-            content="""Você é um assistente prestativo especializado em responder perguntas com base em documentos fornecidos. 
-Seja objetivo, preciso e cite fontes quando possível.""")
-        self.history.append(system_message)
-
-    def _initialize_embeddings(self):
-        """Inicializa o modelo de embeedings"""
-        print(f"Carregando embeddings: {self.config['embeddings_model']}...")
+    def _init_embeddings(self):
+        """Inicializa embeddings."""
+        logger.info(f"Embeddings: {self.config['embeddings_model']}")
         self.embeddings = HuggingFaceEmbeddings(
             model_name=self.config['embeddings_model'],
-            model_kwargs={'device':'cpu'},
-            encode_kwargs={'normalize_embeddings':True},
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True},
         )
-        print('Embeddings carregados!')
-    
-    def load_documents(
-            self, 
-            pdf_paths: Union[str, List[str]], 
-            index_path: str = None,
-            force_recreate: bool = False
-        ) -> bool:
-            """
-            Carrega PDFs criando ou carregando índice FAISS.
-    
-            Args:
-                pdf_paths: Caminho ou lista de caminhos de PDFs
-                index_path: Pasta para salvar/carregar índice (padrão: config['index_path'])
-                force_recreate: Se True, recria índice mesmo se existir
-    
-            Returns:
-                True se sucesso, False caso contrário
-            """
-            if isinstance(pdf_paths, str):
-                 pdf_paths = [pdf_paths]
-    
-            index_path = index_path or self.config['index_path']
-    
-            print('Carregando {} documento(s)'.format(len(pdf_paths)))
-    
-            try:
-                if not force_recreate and os.path.exists(index_path) and os.path.isdir(index_path): #indice salvo?
-                    print('Indice encontrado em {}'.format(index_path))
-                    self._load_vectorstore(index_path)
-                    print('Indice carregado do disco.')
-                else:
-                    if force_recreate and os.path.exists(index_path):
-                        print('Removendo índice antigo...')
-                        shutil.rmtree(index_path)
-    
-                    all_chunks = self._process_pdfs(pdf_paths)
-                    if not all_chunks:
-                        print('Nenhum documento processado.')
-                        return False
-    
-                    print('Criando indice FAISS com {} chunks.'.format(len(all_chunks)))
-                    self.vectorstore = FAISS.from_documents(all_chunks, self.embeddings)
-                    self.vectorstore.save_local(index_path)
-                    print('Indice salvo em {}'.format(index_path))
-    
-                self._setup_retriever()
-                self._create_rag_chain()
-                self.documents_loaded = True
-    
-                print('Sistema RAG ativo.')
-                return True
-    
-            except Exception as e:
-                print('Erro: {}'.format( str(e) ))
-                return False            
 
-    def _process_pdfs(self, pdf_paths:List[str]) -> List[Document]:
-        """Processa pdfs e retorna chunks"""
-        all_chunks = []
+    def _init_system_prompt(self):
+        """System prompt."""
+        system_msg = SystemMessage(
+            content="""Você é um assistente especializado em responder com base em documentos fornecidos.""")
+        self.history.append(system_msg)
+
+    # ========================================================================
+    # UPDATE CONFIG -> PARA FRONTEND
+    # ========================================================================
+
+    def update_config(self, **kwargs) -> Dict[str, Any]:
+        """
+        Atualiza configurações dinamicamente. Recria componentes afetados.
+
+        Args:
+            **kwargs: Configs a atualizar (model, temperature, max_tokens, 
+                     retriever_k, retriever_fetch_k, etc.)
+
+        Returns:
+            Dict com success, message, changes, recreated, current_config
+        """
+        result = {
+            'success': False,
+            'message': '',
+            'changes': [],
+            'recreated': [],
+            'current_config': {},
+            'warning': None
+        }
+
+        # validar chaves
+        valid_keys = set(DEFAULT_CONFIG.keys())
+        invalid = [k for k in kwargs if k not in valid_keys]
+        if invalid:
+            result['message'] = f"Inválidas: {', '.join(invalid)}"
+            result['current_config'] = self.get_config()
+            return result
+
+        # validar valores
+        errors = []
+        if 'temperature' in kwargs:
+            t = kwargs['temperature']
+            if not isinstance(t, (int, float)) or not (0.0 <= t <= 2.0):
+                errors.append("temperature: 0.0-2.0")
+
+        if 'max_tokens' in kwargs:
+            if not isinstance(kwargs['max_tokens'], int) or kwargs['max_tokens'] < 1:
+                errors.append("max_tokens: inteiro > 0")
+
+        if 'retriever_k' in kwargs:
+            if not isinstance(kwargs['retriever_k'], int) or kwargs['retriever_k'] < 1:
+                errors.append("retriever_k: inteiro > 0")
+
+        if errors:
+            result['message'] = "Erros: " + "; ".join(errors)
+            result['current_config'] = self.get_config()
+            return result
+
+        # detectar mudanças
+        changes = []
+        needs_llm = False
+        needs_retriever = False
+        needs_embedding = False
+
+        for key, new_val in kwargs.items():
+            old_val = self.config.get(key)
+            if old_val != new_val:
+                self.config[key] = new_val
+                changes.append(f"{key}: {old_val} → {new_val}")
+
+                if key in LLM_DEPENDENT:
+                    needs_llm = True
+                if key in RETRIEVER_DEPENDENT:
+                    needs_retriever = True
+                if key in EMBEDDING_DEPENDENT:
+                    needs_embedding = True
+
+        if not changes:
+            result['success'] = True
+            result['message'] = "Nenhuma alteração"
+            result['current_config'] = self.get_config()
+            return result
+
+        # aplicar mudanças
+        try:
+            if needs_embedding:
+                logger.info("\nRecriando embeddings...")
+                self._init_embeddings()
+                result['recreated'].append('embeddings')
+                # embeddings mudou → índices recriados
+                if self.indices:
+                    logger.warning("Modelo de embeddings mudou! Índices precisam ser recarregados.")
+                    self.indices = {}
+                    self.retrievers = {}
+                    result['warning'] = "Recarregue os documentos (embeddings alterados)"
+
+            if needs_llm:
+                logger.info("Recriando LLM...")
+                self._init_llm()
+                result['recreated'].append('llm')
+
+            if needs_retriever and self.indices:
+                logger.info("Recriando retrievers...")
+                self._recreate_retrievers()
+                result['recreated'].append('retrievers')
+
+            # recriar chain se LLM ou retriever mudou
+            if (needs_llm or needs_retriever) and self.indices:
+                logger.info("Recriando RAG chain...")
+                self._create_unified_rag_chain()
+                result['recreated'].append('rag_chain')
+
+            result['success'] = True
+            result['message'] = f"Atualizado ({len(changes)} mudanças)"
+            result['changes'] = changes
+
+        except Exception as e:
+            logger.exception("Erro ao atualizar config")
+            result['message'] = f"Erro: {str(e)}"
+
+        result['current_config'] = self.get_config()
+        return result
+
+    def _recreate_retrievers(self):
+        """Recria todos os retrievers com novos parâmetros."""
+        self.retrievers = {}
+        for name, vectorstore in self.indices.items():
+            self.retrievers[name] = vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={
+                    "k": self.config["retriever_k"],
+                    "fetch_k": self.config["retriever_fetch_k"]
+                }
+            )
+
+    def get_config(self) -> Dict[str, Any]:
+        """Retorna config atual."""
+        return self.config.copy()
+
+    def reset_config(self) -> Dict[str, Any]:
+        """Reseta para padrão."""
+        # preservar index_dir e outras configs não-LLM
+        preserved = {k: v for k, v in self.config.items() 
+                    if k not in DEFAULT_CONFIG or k in ['index_dir']}
+        default = DEFAULT_CONFIG.copy()
+        default.update(preserved)
+        return self.update_config(**default)
+
+    # ========================================================================
+    # CARGA PDFs
+    # ========================================================================
+
+    def load_documents(self, pdf_paths: Union[str, List[str]]) -> Dict[str, Any]:
+        """
+        Carrega lista de PDFs com lazy loading.
+        Para cada PDF: se índice existe carrega, senão cria.
+        """
+        if isinstance(pdf_paths, str):
+            pdf_paths = [pdf_paths]
+
+        results = {'loaded': [], 'created': [], 'failed': [], 'total': 0}
+
+        logger.info(f"Processando {len(pdf_paths)} documento(s)...")
+
+        for pdf_path in pdf_paths:
+            pdf_path = os.path.abspath(pdf_path)
+
+            if not os.path.exists(pdf_path):
+                logger.error(f"Não encontrado: {pdf_path}")
+                results['failed'].append({'file': pdf_path, 'error': 'Not found'})
+                continue
+
+            pdf_name = Path(pdf_path).stem
+            safe_name = self._sanitize_name(pdf_name)
+            index_path = os.path.join(self.config['index_dir'], safe_name)
+
+            logger.info(f"Processando: {pdf_name}")
+
+            try:
+                if os.path.exists(index_path) and os.path.isdir(index_path):
+                    # CARREGAR DO DISCO
+                    logger.info(f"Carregando índice existente...")
+                    self._load_single_index(safe_name, index_path)
+                    results['loaded'].append(pdf_name)
+                    logger.info(f"Carregado")
+                else:
+                    # CRIAR NOVO
+                    logger.info(f"Criando novo índice...")
+                    success = self._create_single_index(pdf_path, safe_name, index_path)
+                    if success:
+                        results['created'].append(pdf_name)
+                        logger.info(f"Criado")
+                    else:
+                        results['failed'].append({'file': pdf_name, 'error': 'Process failed'})
+
+            except Exception as e:
+                logger.exception("Erro ao processar PDF %s", pdf_name)
+                results['failed'].append({'file': pdf_name, 'error': str(e)})
+
+        results['total'] = len(self.indices)
+
+        logger.info(f"Resumo: {len(results['loaded'])} carregados, {len(results['created'])} criados, {len(results['failed'])} falhas")
+
+        if self.indices:
+            self._create_unified_rag_chain()
+
+        return results
+
+    def _sanitize_name(self, name: str) -> str:
+        """Nome seguro para pasta."""
+        safe = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in name)
+        return safe[:50]
+
+    def _create_single_index(self, pdf_path: str, name: str, index_path: str) -> bool:
+        """Cria índice para um PDF."""
+        os.makedirs(self.config['index_dir'], exist_ok=True)
+
+        loader = PyMuPDFLoader(pdf_path)
+        docs = loader.load()
+
+        if not docs:
+            return False
+
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config["chunk_size"],
             chunk_overlap=self.config["chunk_overlap"],
-            length_function=len,
             separators=["\n\n", "\n", ".", "!", "?", ";", " ", ""]
         )
+        chunks = text_splitter.split_documents(docs)
 
-        for pdf in pdf_paths:
-            if not os.path.exists(pdf):
-                print('arquivo não encontrado: {}'.format(pdf))
-                continue
+        if not chunks:
+            return False
 
-            print('Processando: {}'.format( Path(pdf).name ))
-            loader = PyMuPDFLoader(pdf)
-            docs = loader.load()
+        for chunk in chunks:
+            chunk.metadata['source_file'] = Path(pdf_path).name
+            chunk.metadata['source_name'] = name
 
-            chunks = text_splitter.split_documents(docs)
-            all_chunks.extend(chunks)
-            print('{} paginas -> {} chunks'.format( len(docs), len(chunks) ))
+        vectorstore = FAISS.from_documents(chunks, self.embeddings)
+        vectorstore.save_local(index_path)
 
-        return all_chunks
+        # metadados
+        metadata = {
+            'original_file': pdf_path,
+            'name': name,
+            'chunks': len(chunks),
+            'pages': len(docs),
+            'created_at': datetime.now().isoformat(),
+            'config': {
+                'embeddings_model': self.config['embeddings_model'],
+                'chunk_size': self.config['chunk_size']
+            }
+        }
+        with open(os.path.join(index_path, 'info.json'), 'w') as f:
+            json.dump(metadata, f, indent=2)
 
-    def _load_vectorstore(self, path:str):
-        """Carrega índice FAISS do disco"""
-        self.vectorstore = FAISS.load_local(
-            path,
+        self.indices[name] = vectorstore
+        self.retrievers[name] = vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": self.config["retriever_k"], "fetch_k": self.config["retriever_fetch_k"]}
+        )
+
+        return True
+
+    def _load_single_index(self, name: str, index_path: str):
+        """Carrega índice existente."""
+        vectorstore = FAISS.load_local(
+            index_path,
             self.embeddings,
             allow_dangerous_deserialization=True
         )
 
-    def _setup_retriever(self):
-        """Configura retriever com MMR"""
-        self.retriever = self.vectorstore.as_retriever(
-            search_type='mmr',
-            search_kwargs={
-                'k': self.config["retriever_k"],
-                "fetch_k": self.config["retriever_fetch_k"],
-                "lambda_mult": 0.7
-            }
+        self.indices[name] = vectorstore
+        self.retrievers[name] = vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": self.config["retriever_k"], "fetch_k": self.config["retriever_fetch_k"]}
         )
 
-    def _create_rag_chain(self):
-        """Cria chain RAG com contextualização de histórico"""
-        
+    # ========================================================================
+    # RAG CHAIN
+    # ========================================================================
+
+    def _search_all_indices(self, query: str) -> List[Document]:
+        """Busca em TODOS os índices."""
+        all_docs = []
+        for name, retriever in self.retrievers.items():
+            docs = retriever.invoke(query)
+            for doc in docs:
+                doc.metadata['index_source'] = name
+            all_docs.extend(docs)
+        return all_docs
+
+    def _create_unified_rag_chain(self):
+        """Cria chain que busca em todos os índices."""
+
         contextualize_q_prompt = ChatPromptTemplate.from_messages([
-            ("system", """Dado o histórico de conversação e a pergunta atual do usuário,
-                          reformule a pergunta para que seja independente do contexto anterior.
-                          Mantenha o idioma original (português).
-                          NÃO responda a pergunta, apenas reformule-a se necessário."""),
+            ("system", "Reformule considerando histórico. Mantenha português."),
             MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
         ])
 
         contextualize_chain = contextualize_q_prompt | self.llm | StrOutputParser()
 
-        def contextualize_or_not(x: dict) -> str:
-            """Reformula se houver histórico, senão usa pergunta original."""
-            if x.get("chat_history") and len(x["chat_history"]) > 1: # tem historico com 2 msgs?
-                return contextualize_chain.invoke(x)
-            return x["input"]
+        def get_context(x: dict) -> str:
+            if x.get("chat_history") and len(x["chat_history"]) > 1:
+                query = contextualize_chain.invoke(x)
+            else:
+                query = x["input"]
 
-        # retriever contextualizado
-        self.contextualized_retriever = (
-            RunnablePassthrough.assign(
-                reformulated_question=lambda x: contextualize_or_not(x)
-            )
-            | (lambda x: self.retriever.invoke(x["reformulated_question"]))
-        )
+            docs = self._search_all_indices(query)
 
-        # chain RAG completa
+            formatted = []
+            for i, doc in enumerate(docs, 1):
+                page = doc.metadata.get("page", "?")
+                source = doc.metadata.get("source_file", "?")
+                formatted.append(f"[Doc {i} | {source} | Pág. {page}]\n{doc.page_content}")
+
+            return "\n\n---\n\n".join(formatted)
+
         qa_prompt = ChatPromptTemplate.from_messages([
-            ("system", """Você é um assistente especializado em responder perguntas baseadas em documentos.
+            ("system", """Responda baseado no contexto (múltiplos documentos).
+Se não souber, diga "Não encontrei".
+Cite a fonte.
 
-                            INSTRUÇÕES:
-                            - Use APENAS o contexto fornecido abaixo para responder
-                            - Se não souber a resposta, diga "Não encontrei essa informação nos documentos"
-                            - Cite a fonte (página) quando possível
-                            - Seja conciso e objetivo
-                            - Responda em português
-                            
-                            Contexto:
-                            {context}"""),
+Contexto:
+{context}"""),
             MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
         ])
 
-        def format_docs(docs: List[Document]) -> str:
-            """Formata documentos para string."""
-            formatted = []
-            for i, doc in enumerate(docs, 1):
-                page = doc.metadata.get("page", "?")
-                source = Path(doc.metadata.get("source", "")).name
-                formatted.append(f"[Doc {i} | Pág. {page} | {source}]\n{doc.page_content}")
-            return "\n\n---\n\n".join(formatted)
-
-        # chain
         self.rag_chain = (
-            RunnablePassthrough.assign(
-                context=lambda x: format_docs(
-                    self.contextualized_retriever.invoke(x)
-                )
-            )
+            RunnablePassthrough.assign(context=lambda x: get_context(x))
             | qa_prompt
             | self.llm
             | StrOutputParser()
         )
 
-    def chat(
-        self, 
-        user_input: str, 
-        use_rag: bool = True, 
-        verbose: bool = True
-    ) -> Dict[str, Any]:
-        """
-        Processa pergunta do usuário.
+    # ========================================================================
+    # CHAT
+    # ========================================================================
 
-        Args:
-            user_input: Pergunta
-            use_rag: Se True, usa documentos; se False, chat puro
-            verbose: Se True, mostra detalhes
-
-        Returns:
-            Dict com answer, sources (se RAG), time, etc.
-        """
+    def chat(self, user_input: str, verbose: bool = True) -> Dict[str, Any]:
+        """Processa pergunta."""
         start_time = time.time()
 
         if verbose:
-            print(f"\n👤 Você: {user_input}")
+            logger.info(f"Entrada do usuário: {user_input}")
 
-        # modo RAG
-        if use_rag and self.documents_loaded:
-            if verbose:
-                print("🔍 Buscando contexto...")
-            
-            response = self.rag_chain.invoke({
-                "input": user_input,
-                "chat_history": self.history
-            })
-
-            # sources para metadados
-            sources = self.contextualized_retriever.invoke({
-                "input": user_input,
-                "chat_history": self.history
-            })
-
-            # apendar historico
-            self.history.append(HumanMessage(content=user_input))
-            self.history.append(AIMessage(content=response))
-
-            elapsed = time.time() - start_time
-
-            if verbose:
-                print(f"\n🤖 Assistente: {response}")
-                print(f"\n📚 Fontes consultadas: {len(sources)}")
-                for i, doc in enumerate(sources[:3], 1):  # top 3
-                    page = doc.metadata.get("page", "?")
-                    source = Path(doc.metadata.get("source", "")).name
-                    print(f"   [{i}] {source} - pág. {page}")
-                print(f"\n⏱️  Tempo: {elapsed:.2f}s")
-
-            # limit histórico
-            self._trim_history()
-
-            return {
-                "answer": response,
-                "sources": sources,
-                "time": elapsed,
-                "mode": "RAG"
-            }
-
-        # modo chat
-        else:
-            if use_rag and not self.documents_loaded:
-                if verbose:
-                    print("RAG solicitado mas documentos não carregados. Usando modo chat.")
-
-            # gerar e apendar
+        if not self.indices:
+            # Modo chat 
             self.history.append(HumanMessage(content=user_input))
             response = self.llm.invoke(self.history)
             self.history.append(AIMessage(content=response.content))
 
-            elapsed = time.time() - start_time
-
             if verbose:
-                print(f"\n🤖 Assistente: {response.content}")
-                print(f"\n⏱️  Tempo: {elapsed:.2f}s (modo chat)")
+                logger.info(f"Resposta: {response.content}")
 
-            self._trim_history()
+            return {"answer": response.content, "mode": "CHAT", "sources": []}
 
-            return {
-                "answer": response.content,
-                "sources": [],
-                "time": elapsed,
-                "mode": "CHAT"
-            }
+        # Modo RAG
+        if verbose:
+            logger.info(f"Buscando em {len(self.indices)} documento(s)...")
+
+        response = self.rag_chain.invoke({
+            "input": user_input,
+            "chat_history": self.history
+        })
+
+        sources = self._search_all_indices(user_input)
+
+        self.history.append(HumanMessage(content=user_input))
+        self.history.append(AIMessage(content=response))
+
+        elapsed = time.time() - start_time
+
+        if verbose:
+            logger.info(f"Resposta: {response}")
+            logger.info(f"Fontes encontradas: {len(sources)}")
+            by_source = {}
+            for doc in sources[:6]:
+                src = doc.metadata.get('source_file', '?')
+                by_source.setdefault(src, []).append(doc.metadata.get('page', '?'))
+            for src, pages in by_source.items():
+                logger.info(f"{src} (páginas: {', '.join(map(str, pages[:3]))})")
+            logger.info(f"Tempo: {elapsed:.2f}s")
+
+        self._trim_history()
+
+        return {"answer": response, "mode": "RAG", "sources": sources, "time": elapsed}
 
     def _trim_history(self):
-        """Limita tamanho do histórico mantendo system message."""
-        max_msgs = self.config["max_history_messages"] * 2  # Human + AI
-        if len(self.history) > max_msgs + 1:  # +1 para system message
-            # manter system message e últimas mensagens
+        """Limita histórico."""
+        max_msgs = self.config["max_history_messages"] * 2
+        if len(self.history) > max_msgs + 1:
             self.history = [self.history[0]] + self.history[-max_msgs:]
 
+    # ========================================================================
+    # UTILITÁRIOS
+    # ========================================================================
 
-    def clear_history(self):
-        """Limpa histórico mantendo system message."""
-        system_msg = self.history[0] if self.history else None
-        self.history = [system_msg] if system_msg else []
-        print("Histórico limpo!")
+    def list_loaded_documents(self) -> List[Dict[str, Any]]:
+        """Lista documentos carregados."""
+        docs = []
+        for name in self.indices.keys():
+            index_path = os.path.join(self.config['index_dir'], name)
+            info_path = os.path.join(index_path, 'info.json')
 
-    def clear_documents(self):
-        """Remove documentos carregados."""
-        self.vectorstore = None
-        self.retriever = None
+            info = {}
+            if os.path.exists(info_path):
+                with open(info_path, 'r') as f:
+                    info = json.load(f)
+
+            docs.append({
+                'name': name,
+                'original_file': info.get('original_file', '?'),
+                'chunks': info.get('chunks', 0),
+                'pages': info.get('pages', 0),
+                'created': info.get('created_at', '?')
+            })
+        return docs
+
+    def remove_document(self, name: str) -> bool:
+        """Remove documento da memória."""
+        if name not in self.indices:
+            logger.warning(f"'{name}' não carregado")
+            return False
+
+        del self.indices[name]
+        del self.retrievers[name]
+
+        if self.indices:
+            self._create_unified_rag_chain()
+        else:
+            self.rag_chain = None
+
+        logger.info(f"'{name}' removido da memória")
+        return True
+
+    def clear_all(self):
+        """Remove todos da memória."""
+        self.indices = {}
+        self.retrievers = {}
         self.rag_chain = None
-        self.contextualized_retriever = None
-        self.documents_loaded = False
-        print("Documentos removidos!")
+        logger.info("Memória limpa")
+
+    def delete_index(self, name: str) -> bool:
+        """Deleta índice do disco permanentemente."""
+        index_path = os.path.join(self.config['index_dir'], name)
+
+        if not os.path.exists(index_path):
+            logger.warning(f"Índice '{name}' não existe")
+            return False
+
+        # remover da memória se estiver carregado
+        if name in self.indices:
+            self.remove_document(name)
+
+        # deletar do disco
+        shutil.rmtree(index_path)
+        logger.info(f"Índice '{name}' deletado do disco")
+        return True
 
     def get_stats(self) -> Dict[str, Any]:
-        """Retorna estatísticas do sistema."""
-        stats = {
-            "documents_loaded": self.documents_loaded,
-            "history_messages": len(self.history),
-            "model": self.config["model"],
-            "embeddings": self.config["embeddings_model"],
+        """Estatísticas."""
+        return {
+            'documents_in_memory': len(self.indices),
+            'document_names': list(self.indices.keys()),
+            'history_messages': len(self.history),
+            'model': self.config['model'],
+            'temperature': self.config['temperature'],
+            'embeddings': self.config['embeddings_model']
         }
-
-        if self.vectorstore:
-            stats["vectors_in_index"] = self.vectorstore.index.ntotal
-
-        return stats
-
-    def save_index(self, path: str = None):
-        """Salva índice FAISS manualmente."""
-        if not self.vectorstore:
-            print("Nenhum índice para salvar!")
-            return
-
-        path = path or self.config["index_path"]
-        self.vectorstore.save_local(path)
-        print(f"Índice salvo em: {path}")
