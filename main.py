@@ -1,15 +1,14 @@
-from src.chatbot import RAGChatBot
+import logging
+from src.chatbot import ChatBot
 
-bot = RAGChatBot()
+logger = logging.getLogger(__name__)
+
+bot = ChatBot()
 
 if __name__ == '__main__':
-    print('-'*100)
-    print('\n= MODO CHAT =')
-    print('-'*100)
-    bot.chat('Qual a capital da frança?', use_rag=False)
+    logger.info('MODO CHAT')
+    bot.chat('Qual a capital da frança?')
 
-    print('-'*100)
-    print('\n= MODO RAG =')
-    print('-'*100)
+    logger.info('MODO RAG')
     bot.load_documents("C:\\Users\\wsant\\Downloads\\O'Reilly - PT - SQL Guia Prático - Alice Zhao.pdf")
     bot.chat('Como usar o comando "select"?')
