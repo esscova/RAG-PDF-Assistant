@@ -22,6 +22,8 @@ from typing import Dict, Any, List, Union
 from datetime import datetime
 import json
 import logging
+import unicodedata
+import re
 
 # LLM 
 from langchain_groq import ChatGroq
@@ -290,25 +292,26 @@ class ChatBot:
             pdf_paths = [pdf_paths]
 
         results = {'loaded': [], 'created': [], 'failed': [], 'total': 0}
+        base_index_dir = Path(self.config['index_dir'])
 
         logger.info(f"Processando {len(pdf_paths)} documento(s)...")
 
         for pdf_path in pdf_paths:
-            pdf_path = os.path.abspath(pdf_path)
+            pdf_path = Path(pdf_path).resolve()
 
-            if not os.path.exists(pdf_path):
+            if not pdf_path.exists():
                 logger.error(f"Não encontrado: {pdf_path}")
                 results['failed'].append({'file': pdf_path, 'error': 'Not found'})
                 continue
 
-            pdf_name = Path(pdf_path).stem
+            pdf_name = pdf_path.stem
             safe_name = self._sanitize_name(pdf_name)
-            index_path = os.path.join(self.config['index_dir'], safe_name)
+            index_path = base_index_dir / safe_name
 
             logger.info(f"Processando: {pdf_name}")
 
             try:
-                if os.path.exists(index_path) and os.path.isdir(index_path):
+                if index_path.exists() and index_path.is_dir():
                     # CARREGAR DO DISCO
                     logger.info(f"Carregando índice existente...")
                     self._load_single_index(safe_name, index_path)
@@ -339,19 +342,30 @@ class ChatBot:
 
     def _sanitize_name(self, name: str) -> str:
         """Nome seguro para pasta."""
-        safe = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in name)
+        nfkd_form = unicodedata.normalize('NFKD', name) # normalizar unicode
+        name_ascii = nfkd_form.encode('ASCII', 'ignore').decode('utf-8') # manter ASCII
+        safe = re.sub(r'[^a-zA-Z0-9\-_]', '_', name_ascii) # sub !letras ! num -> '_'
+        safe = re.sub(r'_+','_', safe) # duplicados
         return safe[:50]
 
-    def _create_single_index(self, pdf_path: str, name: str, index_path: str) -> bool:
-        """Cria índice para um PDF."""
-        os.makedirs(self.config['index_dir'], exist_ok=True)
+    def _create_single_index(self, pdf_path: Path, name: str, index_path: Path) -> bool:
+        """Cria índice para um PDF usando pathlib."""
+        
+        # criar diretorio
+        try:
+            index_path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Erro ao criar pasta {index_path}: {e}")
+            return False
 
-        loader = PyMuPDFLoader(pdf_path)
+        # carregar pdf como str
+        loader = PyMuPDFLoader(str(pdf_path))
         docs = loader.load()
 
         if not docs:
             return False
 
+        # chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config["chunk_size"],
             chunk_overlap=self.config["chunk_overlap"],
@@ -363,15 +377,17 @@ class ChatBot:
             return False
 
         for chunk in chunks:
-            chunk.metadata['source_file'] = Path(pdf_path).name
+            chunk.metadata['source_file'] = pdf_path.name
             chunk.metadata['source_name'] = name
 
         vectorstore = FAISS.from_documents(chunks, self.embeddings)
-        vectorstore.save_local(index_path)
+        
+        # str tbm para faiss 
+        vectorstore.save_local(str(index_path))
 
         # metadados
         metadata = {
-            'original_file': pdf_path,
+            'original_file': str(pdf_path),
             'name': name,
             'chunks': len(chunks),
             'pages': len(docs),
@@ -381,8 +397,10 @@ class ChatBot:
                 'chunk_size': self.config['chunk_size']
             }
         }
-        with open(os.path.join(index_path, 'info.json'), 'w') as f:
-            json.dump(metadata, f, indent=2)
+        
+        # json
+        with open(index_path / 'info.json', 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
 
         self.indices[name] = vectorstore
         self.retrievers[name] = vectorstore.as_retriever(
@@ -392,19 +410,19 @@ class ChatBot:
 
         return True
 
-    def _load_single_index(self, name: str, index_path: str):
-        """Carrega índice existente."""
-        vectorstore = FAISS.load_local(
-            index_path,
-            self.embeddings,
-            allow_dangerous_deserialization=True
-        )
+    def _load_single_index(self, name: str, index_path: Path):
+            """Carrega índice existente."""
+            vectorstore = FAISS.load_local(
+                str(index_path),
+                self.embeddings,
+                allow_dangerous_deserialization=True
+            )
 
-        self.indices[name] = vectorstore
-        self.retrievers[name] = vectorstore.as_retriever(
-            search_type="mmr",
-            search_kwargs={"k": self.config["retriever_k"], "fetch_k": self.config["retriever_fetch_k"]}
-        )
+            self.indices[name] = vectorstore
+            self.retrievers[name] = vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={"k": self.config["retriever_k"], "fetch_k": self.config["retriever_fetch_k"]}
+            )
 
     # ========================================================================
     # RAG CHAIN
@@ -530,25 +548,40 @@ Contexto:
     # ========================================================================
 
     def list_loaded_documents(self) -> List[Dict[str, Any]]:
-        """Lista documentos carregados."""
-        docs = []
-        for name in self.indices.keys():
-            index_path = os.path.join(self.config['index_dir'], name)
-            info_path = os.path.join(index_path, 'info.json')
+            docs = []
+            base_dir = Path(self.config['index_dir'])
+            
+            for name in self.indices.keys():
+                index_path = base_dir / name
+                info_path = index_path / 'info.json'
 
-            info = {}
-            if os.path.exists(info_path):
-                with open(info_path, 'r') as f:
-                    info = json.load(f)
+                info = {}
+                if info_path.exists():
+                    with open(info_path, 'r', encoding='utf-8') as f:
+                        info = json.load(f)
 
-            docs.append({
-                'name': name,
-                'original_file': info.get('original_file', '?'),
-                'chunks': info.get('chunks', 0),
-                'pages': info.get('pages', 0),
-                'created': info.get('created_at', '?')
-            })
-        return docs
+                docs.append({
+                    'name': name,
+                    'original_file': info.get('original_file', '?'),
+                    'chunks': info.get('chunks', 0),
+                    'pages': info.get('pages', 0),
+                    'created': info.get('created_at', '?')
+                })
+            return docs
+
+    def delete_index(self, name: str) -> bool:
+        index_path = Path(self.config['index_dir']) / name
+
+        if not index_path.exists():
+            logger.warning(f"Índice '{name}' não existe")
+            return False
+
+        if name in self.indices:
+            self.remove_document(name)
+
+        shutil.rmtree(index_path)
+        logger.info(f"Índice '{name}' deletado do disco")
+        return True
 
     def remove_document(self, name: str) -> bool:
         """Remove documento da memória."""
@@ -574,22 +607,6 @@ Contexto:
         self.rag_chain = None
         logger.info("Memória limpa")
 
-    def delete_index(self, name: str) -> bool:
-        """Deleta índice do disco permanentemente."""
-        index_path = os.path.join(self.config['index_dir'], name)
-
-        if not os.path.exists(index_path):
-            logger.warning(f"Índice '{name}' não existe")
-            return False
-
-        # remover da memória se estiver carregado
-        if name in self.indices:
-            self.remove_document(name)
-
-        # deletar do disco
-        shutil.rmtree(index_path)
-        logger.info(f"Índice '{name}' deletado do disco")
-        return True
 
     def get_stats(self) -> Dict[str, Any]:
         """Estatísticas."""
