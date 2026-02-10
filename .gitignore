@@ -8,6 +8,7 @@ wheels/
 
 # faiss
 */faiss_index/
+indices/
 */indices/
 
 
@@ -25,3 +26,4 @@ uv.lock
 *-checkpoint.ipynb
 
 .env
+temp_uploads/
