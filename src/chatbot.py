@@ -101,6 +101,7 @@ class ChatBot:
         self.llm = None
         self.embeddings = None
         self.history: List[Any] = []
+        self.last_sources:List[Document] = []
 
         # indices
         self.indices: Dict[str, FAISS] = {}
@@ -542,6 +543,35 @@ Contexto:
         max_msgs = self.config["max_history_messages"] * 2
         if len(self.history) > max_msgs + 1:
             self.history = [self.history[0]] + self.history[-max_msgs:]
+
+    # ========================================================================
+    # CHAT COM STREAMING
+    # ========================================================================
+
+    def chat_stream(self, user_input:str):
+        """
+        Gera resposta em streaming (yield).
+        Atualiza o histórico internamente.
+        """
+
+        if not self.indices:
+            yield "**Modo RAG Estrito**: Por favor, carregue documentos (PDFs) antes de fazer perguntas."
+            return
+    
+        self.last_sources = self._search_all_indices(user_input)
+        input_dict = {
+            'input':user_input,
+            'chat_history':self.history
+        }
+        full_response=''
+
+        for chunk in self.rag_chain.stream(input_dict):
+            full_response += chunk
+            yield chunk
+        
+        self.history.append(HumanMessage(content=user_input))
+        self.history.append(AIMessage(content=full_response))
+        self._trim_history()
 
     # ========================================================================
     # UTILITÁRIOS
