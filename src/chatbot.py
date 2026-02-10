@@ -448,9 +448,14 @@ class ChatBot:
             return "\n\n---\n\n".join(formatted)
 
         qa_prompt = ChatPromptTemplate.from_messages([
-            ("system", """Responda baseado no contexto (múltiplos documentos).
-Se não souber, diga "Não encontrei".
-Cite a fonte.
+            ("system", """Você é um assistente estritamente baseado em documentos.
+Sua tarefa é responder à pergunta do usuário usando APENAS o contexto fornecido abaixo.
+
+Regras Rígidas:
+1. NÃO use seu conhecimento prévio ou externo.
+2. Se a resposta não estiver explicitamente no contexto, diga: "A informação não consta nos documentos fornecidos."
+3. Não invente informações.
+4. Cite a fonte (nome do arquivo) sempre que possível no corpo da resposta.
 
 Contexto:
 {context}"""),
@@ -477,15 +482,11 @@ Contexto:
             logger.info(f"Entrada do usuário: {user_input}")
 
         if not self.indices:
-            # Modo chat 
-            self.history.append(HumanMessage(content=user_input))
-            response = self.llm.invoke(self.history)
-            self.history.append(AIMessage(content=response.content))
-
+            msg = "**Modo RAG Estrito**: Por favor, carregue documentos (PDFs) antes de fazer perguntas."
             if verbose:
-                logger.info(f"Resposta: {response.content}")
+                logger.warning('Tentativa de chat sem documentos carregados')
 
-            return {"answer": response.content, "mode": "CHAT", "sources": []}
+            return {"answer": msg, "mode": "NO_DOCS", "sources": [], "time":0}
 
         # Modo RAG
         if verbose:
