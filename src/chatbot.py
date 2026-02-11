@@ -71,8 +71,8 @@ DEFAULT_CONFIG = {
     "chunk_size": 1000,
     "chunk_overlap": 200,
     "embeddings_model": "sentence-transformers/all-MiniLM-L6-v2",
-    "retriever_k": 4,
-    "retriever_fetch_k": 8,
+    "retriever_k": 3,
+    "retriever_fetch_k": 5,
     "max_history_messages": 10,
     "index_dir": "indices",
 }
@@ -430,14 +430,32 @@ class ChatBot:
     # ========================================================================
 
     def _search_all_indices(self, query: str) -> List[Document]:
-        """Busca em TODOS os índices."""
-        all_docs = []
-        for name, retriever in self.retrievers.items():
-            docs = retriever.invoke(query)
-            for doc in docs:
+        """
+        Busca em TODOS os índices, ordena por relevância e retorna apenas os Top K globais.
+        """
+        global_candidates = []
+        top_k = self.config['retriever_k']
+
+        for name, vectorstore in self.indices.items():
+            # similarity_search_with_score -> (Document, score)
+            # FAISS (L2 distance) MENOR menor score maior similaridade
+            results = vectorstore.similarity_search_with_score(query, k=top_k)
+            
+            for doc, score in results:
+                doc.metadata['score'] = score
                 doc.metadata['index_source'] = name
-            all_docs.extend(docs)
-        return all_docs
+
+                if 'source_file' not in doc.metadata:
+                    doc.metadata['source_file'] = name
+                
+                global_candidates.append(doc)
+
+        global_candidates.sort(key=lambda d: d.metadata['score'])
+
+        # top k docs menor dist = maior relev
+        final_docs = global_candidates[:top_k]
+        
+        return final_docs
 
     def _create_unified_rag_chain(self):
         """Cria chain que busca em todos os índices."""
