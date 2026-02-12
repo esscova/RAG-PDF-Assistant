@@ -25,6 +25,7 @@ O projeto segue o padrão MVC (Model-View-Controller) adaptado para aplicações
 ```text
 RAG-PDF-Assistant/
 ├── assets/              # Recursos estáticos
+├── docs/                # Documentações
 ├── indices/             # Persistência vetorial (FAISS)
 ├── notebooks/           # Notebooks utilizados para construção da classe ChatBot
 ├── src/
