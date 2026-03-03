@@ -135,12 +135,6 @@ class ChatBot:
 ```
 ### Atributos de instância
 
-Aqui está o texto selecionado formatado como uma tabela Markdown:
-
-
-Atributos de Instância
-
-
 | Atributo      | Tipo                        | Descrição                              |
 |---------------|-----------------------------|----------------------------------------|
 | config        | Dict[str, Any]              | Configurações ativas do chatbot        |
